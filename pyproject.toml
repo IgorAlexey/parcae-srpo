@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parcae-srpo"
+version = "0.1.0"
+description = "Recurrent-Depth Gemma 4 trained via Self-Reflective Policy Optimization"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.49",
+    "datasets>=2.0",
+    "accelerate>=0.20",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["parcae"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
