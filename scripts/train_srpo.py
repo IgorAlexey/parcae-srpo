@@ -32,7 +32,7 @@ import torch.nn.functional as F
 import contextlib
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 
 from transformers import AutoTokenizer
 
@@ -397,7 +397,25 @@ class SRPOTrainer:
         self._build_model()
         self._build_optimizer()
         self.dataset = CodeProblemDataset(cfg)
-        self.dataloader = DataLoader(self.dataset, batch_size=cfg.micro_batch_size, shuffle=True, collate_fn=lambda x: list(x))
+
+        if self.world_size > 1:
+            self._sampler = DistributedSampler(
+                self.dataset,
+                num_replicas=self.world_size,
+                rank=self.local_rank,
+                shuffle=True,
+                seed=cfg.seed,
+            )
+            self.dataloader = DataLoader(
+                self.dataset, batch_size=cfg.micro_batch_size,
+                sampler=self._sampler,
+                collate_fn=lambda x: list(x))
+        else:
+            self._sampler = None
+            self.dataloader = DataLoader(
+                self.dataset, batch_size=cfg.micro_batch_size,
+                shuffle=True, collate_fn=lambda x: list(x))
+
         self.scaler = torch.amp.GradScaler('cuda')
         self.step = 0
 
@@ -748,6 +766,7 @@ class SRPOTrainer:
 
         self.optimizer.zero_grad()
         data_iter = iter(self.dataloader)
+        epoch = 0
         time_hist = []
 
         for step_idx in range(cfg.total_steps):
@@ -756,10 +775,13 @@ class SRPOTrainer:
             # accumulate gradients over micro-batches (no_sync until last)
             for acc in range(cfg.gradient_accumulation_steps):
                 is_last = (acc == cfg.gradient_accumulation_steps - 1)
-                sync_ctx = self.model.no_sync() if hasattr(self.model, 'no_sync') and not is_last and self.world_size > 1 else contextlib.nullcontext()
+                sync_ctx = self.model.no_sync() if self.world_size > 1 and not is_last else contextlib.nullcontext()
                 try:
                     batch = next(data_iter)
                 except StopIteration:
+                    epoch += 1
+                    if self._sampler is not None:
+                        self._sampler.set_epoch(epoch)
                     data_iter = iter(self.dataloader)
                     batch = next(data_iter)
 
