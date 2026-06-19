@@ -2853,7 +2853,10 @@ def compile_c_to_asm(c_code: str) -> Optional[str]:
         if result.returncode != 0:
             print(f"  [WARN] GCC -S failed: {result.stderr[:200]}")
             return None
-        return result.stdout
+        # Strip .file and .ident directives — GCC embeds temp file paths.
+        lines = result.stdout.splitlines()
+        clean = [l for l in lines if not l.lstrip().startswith(('.file', '.ident'))]
+        return '\n'.join(clean) + '\n'
     finally:
         os.unlink(c_path)
 

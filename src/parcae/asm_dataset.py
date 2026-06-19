@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import random
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -25,14 +26,14 @@ class AssemblyDataset(Dataset):
         self.items: list[dict] = []
         for p in paths:
             with open(p) as f:
-                for line in f:
+                for lineno, line in enumerate(f, 1):
                     line = line.strip()
                     if not line:
                         continue
                     try:
                         self.items.append(json.loads(line))
                     except json.JSONDecodeError:
-                        continue
+                        warnings.warn(f"Skipping corrupt JSON at {p}:{lineno}")
 
         rng = random.Random(seed)
         rng.shuffle(self.items)
@@ -57,4 +58,8 @@ def build_assembly_paths(data_dir: str = "data") -> list[str]:
         p = Path(data_dir) / pattern
         if p.exists():
             paths.append(str(p))
+    if not paths:
+        warnings.warn(
+            f"No assembly dataset files found under {data_dir}. "
+            "Run scripts/build_asm_dataset.py first.")
     return paths

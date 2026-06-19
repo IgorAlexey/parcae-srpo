@@ -85,7 +85,7 @@ def main():
     parser = argparse.ArgumentParser(description="Build SRPO decompilation dataset")
     parser.add_argument(
         "--max-samples", type=int, default=100000,
-        help="Number of samples to download (default: 100000 = full dataset)",
+        help="Number of samples to download (default: 100000)",
     )
     parser.add_argument(
         "--output", type=str, default="data/decompile/srpo_asm_train.jsonl",
