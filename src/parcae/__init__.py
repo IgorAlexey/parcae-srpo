@@ -17,5 +17,12 @@ Reference papers:
 
 from .injection import LTIInjection
 from .model import RecurrentDepthGemma, RecurrentDepthConfig
+from .asm_dataset import AssemblyDataset, build_assembly_paths
 
-__all__ = ["LTIInjection", "RecurrentDepthGemma", "RecurrentDepthConfig"]
+__all__ = [
+    "LTIInjection",
+    "RecurrentDepthGemma",
+    "RecurrentDepthConfig",
+    "AssemblyDataset",
+    "build_assembly_paths",
+]

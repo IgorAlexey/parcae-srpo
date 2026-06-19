@@ -8,3 +8,5 @@ build/
 models/
 checkpoints/
 .venv/
+research_*.md
+progress.md

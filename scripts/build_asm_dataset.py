@@ -84,12 +84,12 @@ def convert_to_srpo(pairs: list[dict]) -> list[dict]:
 def main():
     parser = argparse.ArgumentParser(description="Build SRPO decompilation dataset")
     parser.add_argument(
-        "--max-samples", type=int, default=20000,
-        help="Number of samples to download (default: 20000)",
+        "--max-samples", type=int, default=100000,
+        help="Number of samples to download (default: 100000 = full dataset)",
     )
     parser.add_argument(
         "--output", type=str, default="data/decompile/srpo_asm_train.jsonl",
-        help="Output JSONL path (default: data/decompile/srpo_asm_train.jsonl)",
+        help="Output JSONL path",
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed (default: 42)",
