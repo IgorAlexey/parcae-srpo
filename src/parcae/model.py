@@ -673,12 +673,12 @@ class RecurrentDepthGemma(nn.Module):
         top_k: int = 50,
         return_logprobs: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Autoregressive generation with DynamicCache KV caching.
+        """Generate tokens with DynamicCache KV caching.
 
-        First token via self.forward() (injection).  Pre-fills HF
-        DynamicCache via self._language_model.forward(), then
-        O(N) incremental decode.  Injection applied during initial
-        forward only; recurrence primarily matters for training.
+        First token via self.forward() (injection + PLE).  Pre-fills
+        HF DynamicCache separately because self.forward() uses custom
+        block structure incompatible with DynamicCache extraction.
+        Double prefill is a known cost; correct output verified.
         """
         device = input_ids.device
         token_lps = [] if return_logprobs else None
@@ -695,7 +695,7 @@ class RecurrentDepthGemma(nn.Module):
         if return_logprobs:
             token_lps.append(torch.log_softmax(raw, dim=-1).gather(-1, next_tok))
 
-        # Pre-fill KV cache via HF native model
+        # Pre-fill DynamicCache via HF native model
         lm = self._language_model
         out = lm(input_ids=input_ids, use_cache=True)
         past = out.past_key_values
@@ -729,47 +729,6 @@ class RecurrentDepthGemma(nn.Module):
             return full_ids, torch.cat(token_lps, dim=-1)
         return full_ids
 
-    def _steal_kv_cache(self) -> dict:
-        """Return KV caches captured during the last forward() call.
-
-        prelude and coda caches from _last_present_kv on attention modules.
-        recurrent caches from self._kv_rec (list per iteration).
-        """
-        def _get_kv(idx):
-            layer = self._layer_module_list[idx]
-            attn = getattr(layer, 'self_attn', None) or getattr(layer, 'attn', None)
-            return getattr(attn, '_last_present_kv', None) if attn else None
-
-        prelude_kv = {idx: _get_kv(idx) for idx in self.prelude_indices}
-        coda_kv = {idx: _get_kv(idx) for idx in self.coda_indices}
-        rec_kv = getattr(self, '_kv_rec', [None] * self._last_n_loops)
-        return {"prelude": prelude_kv, "coda": coda_kv, "recurrent": rec_kv}
-
-    def _run_block_incremental(
-        self,
-        h: torch.Tensor,
-        layer_indices: list[int],
-        position_embeddings: dict,
-        attention_mask: Optional[torch.Tensor],
-        position_ids: Optional[torch.Tensor],
-        kv_cache: dict,
-        per_layer_inputs: Optional[torch.Tensor] = None,
-        shared_kv_states: Optional[dict] = None,
-    ) -> torch.Tensor:
-        """Run block on a single token with KV cache.
-
-        kv_cache maps layer_idx -> past_key_value tuple (or None).
-        Updated past_key_values are written back in-place.
-        """
-        for idx in layer_indices:
-            layer = self._layer_module_list[idx]
-            layer_type = self._hf_config.text_config.layer_types[idx]
-            ple = None
-            if per_layer_inputs is not None:
-                ple = per_layer_inputs[:, :, idx, :]
-            pkv = kv_cache.get(idx)
-            layer_out = layer(
-                hidden_states=h,
                 per_layer_input=ple,
                 shared_kv_states=shared_kv_states,
                 position_embeddings=position_embeddings[layer_type],
