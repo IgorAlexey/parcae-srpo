@@ -548,6 +548,7 @@ class RecurrentDepthGemma(nn.Module):
             return_kv_cache=return_kv_cache)
         h = prelude_out[0] if isinstance(prelude_out, tuple) else prelude_out
         e = h.clone().detach()
+        self._last_e = e  # cached for generate injection
 
         def _run_rec(h, _t):
             return self._run_block(
@@ -673,18 +674,26 @@ class RecurrentDepthGemma(nn.Module):
         top_k: int = 50,
         return_logprobs: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Generate tokens with DynamicCache KV caching.
+        """Generate tokens with injection applied at every step.
 
-        First token via self.forward() (injection + PLE).  Pre-fills
-        HF DynamicCache separately because self.forward() uses custom
-        block structure incompatible with DynamicCache extraction.
-        Double prefill is a known cost; correct output verified.
+        self.forward() for prompt: produces logits + caches e.
+        Incremental decode via self._language_model with DynamicCache,
+        injecting (A-1)*h + B*norm(e) after each step.  Position
+        IDs computed from cache length for correct RoPE encoding.
         """
         device = input_ids.device
         token_lps = [] if return_logprobs else None
 
-        # First token: injected forward
+        # Prompt forward: logits + cache e for injection
         logits = self.forward(input_ids, n_loops=n_loops, return_logits=True)
+        e = getattr(self, '_last_e', None)
+
+        # Pre-fill DynamicCache
+        lm = self._language_model
+        out = lm(input_ids=input_ids, use_cache=True)
+        past = out.past_key_values
+
+        # Sample first token
         raw = logits[:, -1, :]
         next_l = raw / temperature
         if top_k > 0:
@@ -695,17 +704,23 @@ class RecurrentDepthGemma(nn.Module):
         if return_logprobs:
             token_lps.append(torch.log_softmax(raw, dim=-1).gather(-1, next_tok))
 
-        # Pre-fill DynamicCache via HF native model
-        lm = self._language_model
-        out = lm(input_ids=input_ids, use_cache=True)
-        past = out.past_key_values
-
         all_toks = next_tok
+        inj = self.injection
 
         for _ in range(1, max_new_tokens):
-            out = lm(input_ids=next_tok, use_cache=True, past_key_values=past)
+            pos = torch.arange(
+                past.get_seq_length(),
+                past.get_seq_length() + 1, device=device).unsqueeze(0)
+            out = lm(
+                input_ids=next_tok, use_cache=True, past_key_values=past,
+                position_ids=pos)
             past = out.past_key_values
-            h = self.norm(out.last_hidden_state)
+            h = out.last_hidden_state
+
+            if e is not None:
+                h = inj(h, e, h)  # inj.forward applies prelude_norm to e
+
+            h = self.norm(h)
             step_logits = self.lm_head(h)
             if self._logit_softcap is not None:
                 step_logits = (self._logit_softcap *
@@ -721,29 +736,13 @@ class RecurrentDepthGemma(nn.Module):
             if return_logprobs:
                 token_lps.append(torch.log_softmax(raw, dim=-1).gather(-1, next_tok))
             all_toks = torch.cat([all_toks, next_tok], dim=1)
-            if (next_tok == self._eos_id).all():
+            if (next_tok == self._eos_id).all(dim=-1).all():
                 break
 
         full_ids = torch.cat([input_ids, all_toks], dim=1)
         if return_logprobs:
             return full_ids, torch.cat(token_lps, dim=-1)
         return full_ids
-
-                per_layer_input=ple,
-                shared_kv_states=shared_kv_states,
-                position_embeddings=position_embeddings[layer_type],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=pkv,
-                use_cache=True,
-            )
-            # h may be tuple (hidden_states, present_key_value) if use_cache=True
-            if isinstance(layer_out, tuple):
-                h, pkv_new = layer_out
-                kv_cache[idx] = pkv_new
-            else:
-                h = layer_out
-        return h
 
     def trainable_parameters(self):
         """Return only the new (non-pretrained) parameters for training."""
