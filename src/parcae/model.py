@@ -673,102 +673,61 @@ class RecurrentDepthGemma(nn.Module):
         top_k: int = 50,
         return_logprobs: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Autoregressive generation with full KV caching.
+        """Autoregressive generation with DynamicCache KV caching.
 
-        If return_logprobs=True, returns (token_ids, token_logprobs) where
-        token_logprobs contains the log-prob of each generated token under
-        the raw (pre-sampling) distribution.  Single forward pass.
+        First token via self.forward() (injection).  Pre-fills HF
+        DynamicCache via self._language_model.forward(), then
+        O(N) incremental decode.  Injection applied during initial
+        forward only; recurrence primarily matters for training.
         """
         device = input_ids.device
-        B, prompt_len = input_ids.shape
-
-        # Token 0: full forward + capture KV
-        logits_full = self.forward(
-            input_ids, n_loops=n_loops, return_logits=True,
-            return_kv_cache=True)
-        kv_all = self._steal_kv_cache()
-
-        # Log-probs accumulator
         token_lps = [] if return_logprobs else None
 
-        # Sample first token
-        raw_logits = logits_full[:, -1, :]  # pre-temperature
-        next_logits = raw_logits / temperature
+        # First token: injected forward
+        logits = self.forward(input_ids, n_loops=n_loops, return_logits=True)
+        raw = logits[:, -1, :]
+        next_l = raw / temperature
         if top_k > 0:
-            v, _ = next_logits.topk(top_k)
-            next_logits[next_logits < v[:, -1:]] = float("-inf")
-        probs = torch.softmax(next_logits, dim=-1)
+            v, _ = next_l.topk(min(top_k, next_l.shape[-1]))
+            next_l[next_l < v[:, -1:]] = float("-inf")
+        probs = torch.softmax(next_l, dim=-1)
         next_tok = torch.multinomial(probs, num_samples=1)
         if return_logprobs:
-            token_lps.append(F.log_softmax(raw_logits, dim=-1).gather(-1, next_tok))
-        all_ids = torch.cat([input_ids, next_tok], dim=1)
+            token_lps.append(torch.log_softmax(raw, dim=-1).gather(-1, next_tok))
 
-        # Incremental generation
-        gen_count = 1
-        pos_tensor = torch.arange(prompt_len, prompt_len + max_new_tokens, device=device)
+        # Pre-fill KV cache via HF native model
+        lm = self._language_model
+        out = lm(input_ids=input_ids, use_cache=True)
+        past = out.past_key_values
+
+        all_toks = next_tok
+
         for _ in range(1, max_new_tokens):
-            new_tok = all_ids[:, -1:]  # (B, 1)
-            gen_count += 1
-            pos_ids = pos_tensor[gen_count-1:gen_count].unsqueeze(0)
-
-            h = self.embed_tokens(new_tok)
-            pos_embeds = self._compute_position_embeddings(h, pos_ids)
-
-            # Per-Layer Embeddings for the new token (E2B/E4B models)
-            ple_new = None
-            if hasattr(self, "_ple_enabled") and self._ple_enabled:
-                ple_new = self._compute_ple(new_tok, h)
-
-            # Fresh shared KV per token (layers overwrite, not append)
-            shared_kv = collections.UserDict()
-
-            # Prelude: incremental with cached KV
-            h = self._run_block_incremental(
-                h, self.prelude_indices, pos_embeds, None, pos_ids,
-                kv_cache=kv_all["prelude"], per_layer_inputs=ple_new,
-                shared_kv_states=shared_kv)
-
-            e = h.detach()
-
-            # Recurrent: loop via shared _recurrent_loop method
-            def _run_rec_inc(h, t):
-                return self._run_block_incremental(
-                    h, self.recurrent_indices, pos_embeds, None, pos_ids,
-                    kv_cache=kv_all["recurrent"][t], per_layer_inputs=ple_new,
-                    shared_kv_states=shared_kv,
-                )
-
-            h, _, _ = self._recurrent_loop(h, e, n_loops, _run_rec_inc, return_kv_cache=False)
-
-            # Coda: incremental with cached KV
-            h = self._run_block_incremental(
-                h, self.coda_indices, pos_embeds, None, pos_ids,
-                kv_cache=kv_all["coda"], per_layer_inputs=ple_new,
-                shared_kv_states=shared_kv)
-
-            h = self.norm(h)
-            logits = self.lm_head(h)  # (B, 1, V)
+            out = lm(input_ids=next_tok, use_cache=True, past_key_values=past)
+            past = out.past_key_values
+            h = self.norm(out.last_hidden_state)
+            step_logits = self.lm_head(h)
             if self._logit_softcap is not None:
-                logits = self._logit_softcap * torch.tanh(logits.float() / self._logit_softcap).to(logits.dtype)
-
-            # Sample
-            raw_logits = logits[:, -1, :]  # pre-temperature
-            next_logits = raw_logits / temperature
+                step_logits = (self._logit_softcap *
+                    torch.tanh(step_logits.float() / self._logit_softcap)
+                    .to(step_logits.dtype))
+            raw = step_logits[:, -1, :]
+            next_l = raw / temperature
             if top_k > 0:
-                v, _ = next_logits.topk(top_k)
-                next_logits[next_logits < v[:, -1:]] = float("-inf")
-            probs = torch.softmax(next_logits, dim=-1)
+                v, _ = next_l.topk(min(top_k, next_l.shape[-1]))
+                next_l[next_l < v[:, -1:]] = float("-inf")
+            probs = torch.softmax(next_l, dim=-1)
             next_tok = torch.multinomial(probs, num_samples=1)
             if return_logprobs:
-                token_lps.append(F.log_softmax(raw_logits, dim=-1).gather(-1, next_tok))
-            all_ids = torch.cat([all_ids, next_tok], dim=1)
-
+                token_lps.append(torch.log_softmax(raw, dim=-1).gather(-1, next_tok))
+            all_toks = torch.cat([all_toks, next_tok], dim=1)
             if (next_tok == self._eos_id).all():
                 break
 
+        full_ids = torch.cat([input_ids, all_toks], dim=1)
         if return_logprobs:
-            return all_ids, torch.cat(token_lps, dim=-1)  # (B, L_new, 1) -> (B, L_new)
-        return all_ids
+            return full_ids, torch.cat(token_lps, dim=-1)
+        return full_ids
 
     def _steal_kv_cache(self) -> dict:
         """Return KV caches captured during the last forward() call.
