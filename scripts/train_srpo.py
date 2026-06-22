@@ -23,6 +23,7 @@ import time
 import random
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, Generator
 
 import numpy as np
@@ -394,6 +395,7 @@ class SRPOTrainer:
 
         self._seed()
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_path or cfg.model_name)
+        self._load_chat_template(cfg)
         self._build_model()
         self._build_optimizer()
         self.dataset = CodeProblemDataset(cfg)
@@ -423,6 +425,80 @@ class SRPOTrainer:
         torch.manual_seed(self.cfg.seed + self.local_rank)
         np.random.seed(self.cfg.seed + self.local_rank)
         random.seed(self.cfg.seed + self.local_rank)
+
+    def _load_chat_template(self, cfg):
+        """Ensure the tokenizer has a chat template.
+
+        Gemma 4 E2B ships chat_template.jinja separately (HF issue 45205).
+        Other model families embed it in tokenizer_config.json; skip if
+        already present.
+
+        Template is small (~17 KB); every DDP rank reads it independently
+        at startup.  No broadcast needed.
+        """
+        if self.tokenizer.chat_template:
+            return  # already loaded from tokenizer_config.json
+
+        template = None
+
+        if cfg.model_path:
+            local_dir = Path(cfg.model_path)
+            if not local_dir.is_dir():
+                raise NotADirectoryError(
+                    f"model_path={cfg.model_path} is not a directory")
+            local_tmpl = local_dir / "chat_template.jinja"
+            if local_tmpl.exists():
+                template = local_tmpl.read_text()
+                if self.local_rank == 0:
+                    print(f"Loaded chat template from {local_tmpl}")
+
+        # Try HF hub if no local template found.
+        if template is None and cfg.model_name:
+            from huggingface_hub import hf_hub_download
+            from huggingface_hub.errors import (
+                EntryNotFoundError, RepositoryNotFoundError)
+            try:
+                cache = hf_hub_download(
+                    repo_id=cfg.model_name, filename="chat_template.jinja")
+                template = Path(cache).read_text()
+                if self.local_rank == 0:
+                    print(f"Loaded chat template from {cache}")
+            except (EntryNotFoundError, RepositoryNotFoundError, OSError):
+                pass
+
+        if template is None:
+            return  # no separate template file; raw text is fine
+
+        self.tokenizer.chat_template = template
+
+    def _apply_chat_template(self, content: str) -> str:
+        """Wrap content in chat template if available, otherwise return raw."""
+        if self.tokenizer.chat_template is None:
+            return content
+        messages = [{"role": "user", "content": content}]
+        return self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+
+    def _tokenize_safe(self, texts: list[str], max_length: int = 512):
+        """Tokenize with truncation and one-shot overflow warning."""
+        # Chat template already renders all special tokens.
+        add_special = self.tokenizer.chat_template is None
+        enc = self.tokenizer(
+            texts, return_tensors="pt", padding=True,
+            truncation=True, max_length=max_length,
+            add_special_tokens=add_special,
+        )
+        # Detect truncation: a sample reached max_length and has no trailing pad.
+        at_limit = (enc["input_ids"].shape[1] >= max_length)
+        full_mask = enc["attention_mask"].sum(dim=1) >= max_length
+        truncated = (at_limit and full_mask.any())
+        if truncated and not hasattr(self, '_trunc_warned'):
+            self._trunc_warned = True
+            if self.local_rank == 0:
+                n = full_mask.sum().item()
+                print(f"[WARN] {n} prompts at {max_length}-token limit "
+                      "(may be truncated)")
+        return enc.to(self.device)
 
     def _build_model(self):
         rd = RecurrentDepthConfig(
@@ -518,9 +594,9 @@ class SRPOTrainer:
         results = []
         G = self.cfg.group_size
 
-        # Tokenize all prompts together
-        enc = self.tokenizer(prompts, return_tensors="pt", padding=True,
-                             truncation=True, max_length=512).to(self.device)
+        # Tokenize all prompts together (apply chat template first)
+        formatted = [self._apply_chat_template(p) for p in prompts]
+        enc = self._tokenize_safe(formatted)
         prompt_ids = enc["input_ids"]
         attn_mask = enc["attention_mask"]
         B = len(prompts)
@@ -661,9 +737,8 @@ class SRPOTrainer:
                 f + "\n\nNow write the corrected code for:\n" + prompts[c["batch_idx"]]
                 for c, f in [(c, c["sdpo_feedback"]) for c in failed]
             ]
-            tp_enc = self.tokenizer(
-                teacher_prompts, return_tensors="pt", truncation=True,
-                max_length=512, padding=True).to(self.device)
+            teacher_formatted = [self._apply_chat_template(p) for p in teacher_prompts]
+            tp_enc = self._tokenize_safe(teacher_formatted)
             tp_lens = tp_enc["attention_mask"].sum(dim=-1).long()
 
             # Teacher generates batched (old policy, no grad).
