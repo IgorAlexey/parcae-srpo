@@ -83,7 +83,8 @@ class TrainConfig:
     seed: int = 42
 
     # ── Dataset ──
-    dataset: str = "mbpp"                  # mbpp | humaneval | bigcodebench | builtin
+    dataset: str = "asm"                  # asm | mbpp | both | humaneval | bigcodebench | builtin
+    asm_data_dir: str = "data"             # assembly JSONL directory
     max_prompts: int = 500
 
     # ── Distributed ──
@@ -108,18 +109,16 @@ class CodeProblemDataset:
                 ds = load_dataset("google-research-datasets/mbpp", "sanitized", split="train")
                 items = []
                 for item in ds:
-                    # MBPP: test_list is a list of assertion strings, join them
                     tests = item["test_list"]
                     test_str = "\n".join(tests)
-                    # Extract entry point from first test (e.g., 'assert funcname(...' -> 'funcname')
                     entry = tests[0].split("assert ")[1].split("(")[0] if tests else "solution"
-                    # Build full prompt: description + function signature from code
-                    func_sig = item["code"].split("\n")[0]  # first line is 'def funcname(args):'
+                    func_sig = item["code"].split("\n")[0]
                     full_prompt = f"{item['prompt']}\n{func_sig}"
                     items.append({
                         "prompt": full_prompt,
                         "test": test_str,
                         "entry": entry,
+                        "kind": "code",
                     })
             elif name == "humaneval":
                 ds = load_dataset("openai/openai_humaneval", split="test")
@@ -129,10 +128,51 @@ class CodeProblemDataset:
                         "prompt": item["prompt"],
                         "test": "\n".join([f"assert {t}" for t in item.get("test", "").split("\n") if t.strip()]) if item.get("test") else "",
                         "entry": item.get("entry_point", "solution"),
+                        "kind": "code",
                     })
             elif name == "bigcodebench":
                 ds = load_dataset("bigcode/bigcodebench", split="v0.1")
-                items = [{"prompt": i["prompt"], "test": i.get("test",""), "entry": i.get("entry_point","solution")} for i in ds]
+                items = [{"prompt": i["prompt"], "test": i.get("test",""), "entry": i.get("entry_point","solution"), "kind": "code"} for i in ds]
+            elif name == "asm":
+                from parcae.asm_dataset import AssemblyDataset, build_assembly_paths
+                paths = build_assembly_paths(self.cfg.asm_data_dir)
+                if not paths:
+                    raise FileNotFoundError(f"No JSONL under {self.cfg.asm_data_dir}")
+                ds = AssemblyDataset(paths, seed=self.cfg.seed, max_samples=self.cfg.max_prompts)
+                items = [{"prompt": i["prompt"], "target": i["target"], "kind": "asm"} for i in ds]
+                return items  # already shuffled, don't re-shuffle below
+            elif name == "both":
+                # Load code problems
+                code_items = []
+                try:
+                    ds = load_dataset("google-research-datasets/mbpp", "sanitized", split="train")
+                    for item in ds:
+                        tests = item["test_list"]
+                        test_str = "\n".join(tests)
+                        entry = tests[0].split("assert ")[1].split("(")[0] if tests else "solution"
+                        func_sig = item["code"].split("\n")[0]
+                        full_prompt = f"{item['prompt']}\n{func_sig}"
+                        code_items.append({
+                            "prompt": full_prompt, "test": test_str,
+                            "entry": entry, "kind": "code",
+                        })
+                except Exception:
+                    code_items = _builtin_problems(self.cfg.max_prompts // 2)
+                    for i in code_items:
+                        i["kind"] = "code"
+                # Load assembly
+                from parcae.asm_dataset import AssemblyDataset, build_assembly_paths
+                paths = build_assembly_paths(self.cfg.asm_data_dir)
+                asm_items = []
+                if paths:
+                    ds = AssemblyDataset(paths, seed=self.cfg.seed, max_samples=self.cfg.max_prompts)
+                    asm_items = [{"prompt": i["prompt"], "target": i["target"], "kind": "asm"} for i in ds]
+                # Interleave
+                rng = random.Random(self.cfg.seed)
+                rng.shuffle(code_items)
+                items = code_items[:self.cfg.max_prompts // 2] + asm_items[:self.cfg.max_prompts // 2]
+                rng.shuffle(items)
+                return items[: self.cfg.max_prompts]
             else:
                 raise ValueError(name)
 
@@ -140,7 +180,11 @@ class CodeProblemDataset:
             rng.shuffle(items)
             return items[: self.cfg.max_prompts]
         except Exception:
-            return _builtin_problems(self.cfg.max_prompts)
+            # _builtin_problems returns code problems
+            items = _builtin_problems(self.cfg.max_prompts)
+            for i in items:
+                i["kind"] = "code"
+            return items
 
     def __len__(self) -> int:
         return len(self._items)
@@ -248,6 +292,52 @@ def extract_code(text: str) -> str:
                 return code.strip()
     # Fallback: return raw text (model may output code directly)
     return text.strip()
+
+
+def extract_code_c(text: str) -> str:
+    """Extract C code from model completion. Looks for ```c fence."""
+    if "```c" in text:
+        parts = text.split("```c", 1)
+        if len(parts) > 1:
+            code = parts[1].split("```", 1)[0]
+            if code.strip():
+                return code.strip()
+    # Try any code fence
+    if "```" in text:
+        parts = text.split("```", 1)
+        if len(parts) > 1:
+            code = parts[1].split("```", 1)[0]
+            if code.strip():
+                return code.strip()
+    return text.strip()
+
+
+def verify_compile(code: str, timeout: float = 15.0) -> tuple[float, str]:
+    """Compile C code with GCC. Returns (1.0, feedback) on success."""
+    import tempfile
+    if not code.strip():
+        return 0.0, "Empty code."
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".c", delete=False,
+    ) as f:
+        f.write(code)
+        src_path = f.name
+    bin_path = src_path.replace(".c", "")
+    try:
+        r = subprocess.run(
+            ["gcc", "-O2", "-Wall", "-o", bin_path, src_path],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode == 0:
+            return 1.0, "Compiled successfully."
+        return 0.0, r.stderr.strip()[:600]
+    except subprocess.TimeoutExpired:
+        return 0.0, "Compilation timed out."
+    except Exception as e:
+        return 0.0, str(e)[:600]
+    finally:
+        Path(src_path).unlink(missing_ok=True)
+        Path(bin_path).unlink(missing_ok=True)
 
 
 def verify(code: str, test: str, timeout: float = 10.0) -> tuple[float, str]:
@@ -364,18 +454,20 @@ def build_feedback(
     error: str,
     problem: str,
     correct_demos: list[str],
+    kind: str = "code",
 ) -> str:
     """Build self-distillation feedback for a failed completion."""
+    lang = "c" if kind == "asm" else "python"
     if correct_demos:
         demo = correct_demos[0]
         return (
-            f"Your code:\n```python\n{failed_code}\n```\n\n"
+            f"Your code:\n```{lang}\n{failed_code}\n```\n\n"
             f"Error: {error}\n\n"
-            f"Here is a working solution:\n```python\n{demo}\n```\n\n"
+            f"Here is a working solution:\n```{lang}\n{demo}\n```\n\n"
             f"Write a corrected version."
         )
     return (
-        f"Your code:\n```python\n{failed_code}\n```\n\n"
+        f"Your code:\n```{lang}\n{failed_code}\n```\n\n"
         f"Error: {error}\n\nIdentify and fix the mistake."
     )
 
@@ -674,8 +766,12 @@ class SRPOTrainer:
         for i, c in enumerate(comps):
             b = i // G
             prob = batch[b]
-            code = extract_code(c["text"])
-            reward, fb = verify(code, prob["test"])
+            if prob.get("kind") == "asm":
+                code = extract_code_c(c["text"])
+                reward, fb = verify_compile(code)
+            else:
+                code = extract_code(c["text"])
+                reward, fb = verify(code, prob["test"])
             c["reward"] = reward
             c["feedback"] = fb
             c["batch_idx"] = b
@@ -689,7 +785,8 @@ class SRPOTrainer:
         for c in comps:
             if c["reward"] <= 0:
                 demos = correct_by_prompt[c["batch_idx"]]
-                c["sdpo_feedback"] = build_feedback(c["text"], c["feedback"], prompts[c["batch_idx"]], demos)
+                k = batch[c["batch_idx"]].get("kind", "code")
+                c["sdpo_feedback"] = build_feedback(c["text"], c["feedback"], prompts[c["batch_idx"]], demos, kind=k)
 
         # --- GRPO branch: correct samples (batched) ---
         correct = [c for c in comps if c["reward"] > 0]
