@@ -54,7 +54,7 @@ class LTIInjection(nn.Module):
         # B_raw: learned input injection matrix (full, not constrained)
         # Euler discretization: B = dt * B_raw
         # Initialized small so input injection starts negligible
-        self.B_raw = nn.Parameter(torch.randn(dim) * 0.01)
+        self.B_raw = nn.Parameter(torch.randn(dim) * 0.1)
 
         # C: output projection (removed; unused, 14.7M dead params)
 

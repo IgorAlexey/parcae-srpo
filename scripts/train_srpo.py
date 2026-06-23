@@ -60,9 +60,9 @@ class TrainConfig:
     bptt_ratio: float = 0.5                # μ_bwd = ceil(T * bptt_ratio)
 
     # ── SRPO algorithm ──
-    group_size: int = 2                    # G completions per prompt
-    max_response_tokens: int = 64           # very short for memory
-    gen_temperature: float = 0.8
+    group_size: int = 6                    # G completions per prompt (≥4 for meaningful GRPO advantage; Unsloth/TRL use 6-8)
+    max_response_tokens: int = 128          # enough for code/assembly (DeepSeekMath: 4K; we trade length for memory)
+    gen_temperature: float = 1.0            # 1.0 standard for RL exploration (TRL/DeepSeekMath/veRL all default 1.0)
     clip_epsilon: float = 0.2
     clip_epsilon_high: float = 0.28        # GSPO Clip-Higher
     kl_beta: float = 0.0
@@ -101,90 +101,82 @@ class CodeProblemDataset:
         self._items = self._load()
 
     def _load(self) -> list[dict]:
-        try:
-            from datasets import load_dataset
+        name = self.cfg.dataset
 
-            name = self.cfg.dataset
-            if name == "mbpp":
-                ds = load_dataset("google-research-datasets/mbpp", "sanitized", split="train")
-                items = []
-                for item in ds:
-                    tests = item["test_list"]
-                    test_str = "\n".join(tests)
-                    entry = tests[0].split("assert ")[1].split("(")[0] if tests else "solution"
-                    func_sig = item["code"].split("\n")[0]
-                    full_prompt = f"{item['prompt']}\n{func_sig}"
-                    items.append({
-                        "prompt": full_prompt,
-                        "test": test_str,
-                        "entry": entry,
-                        "kind": "code",
-                    })
-            elif name == "humaneval":
-                ds = load_dataset("openai/openai_humaneval", split="test")
-                items = []
-                for item in ds:
-                    items.append({
-                        "prompt": item["prompt"],
-                        "test": "\n".join([f"assert {t}" for t in item.get("test", "").split("\n") if t.strip()]) if item.get("test") else "",
-                        "entry": item.get("entry_point", "solution"),
-                        "kind": "code",
-                    })
-            elif name == "bigcodebench":
-                ds = load_dataset("bigcode/bigcodebench", split="v0.1")
-                items = [{"prompt": i["prompt"], "test": i.get("test",""), "entry": i.get("entry_point","solution"), "kind": "code"} for i in ds]
-            elif name == "asm":
-                from parcae.asm_dataset import AssemblyDataset, build_assembly_paths
-                paths = build_assembly_paths(self.cfg.asm_data_dir)
-                if not paths:
-                    raise FileNotFoundError(f"No JSONL under {self.cfg.asm_data_dir}")
+        # asm handled separately — must not fall through to try/except
+        if name in ("asm", "both"):
+            from parcae.asm_dataset import AssemblyDataset, build_assembly_paths
+            paths = build_assembly_paths(self.cfg.asm_data_dir)
+            if not paths:
+                raise FileNotFoundError(
+                    f"No JSONL under {self.cfg.asm_data_dir}. "
+                    "Run scripts/build_asm_dataset.py first.")
+            if name == "asm":
                 ds = AssemblyDataset(paths, seed=self.cfg.seed, max_samples=self.cfg.max_prompts)
-                items = [{"prompt": i["prompt"], "target": i["target"], "kind": "asm"} for i in ds]
-                return items  # already shuffled, don't re-shuffle below
-            elif name == "both":
-                # Load code problems
-                code_items = []
-                try:
-                    ds = load_dataset("google-research-datasets/mbpp", "sanitized", split="train")
-                    for item in ds:
-                        tests = item["test_list"]
-                        test_str = "\n".join(tests)
-                        entry = tests[0].split("assert ")[1].split("(")[0] if tests else "solution"
-                        func_sig = item["code"].split("\n")[0]
-                        full_prompt = f"{item['prompt']}\n{func_sig}"
-                        code_items.append({
-                            "prompt": full_prompt, "test": test_str,
-                            "entry": entry, "kind": "code",
-                        })
-                except Exception:
-                    code_items = _builtin_problems(self.cfg.max_prompts // 2)
-                    for i in code_items:
-                        i["kind"] = "code"
-                # Load assembly
-                from parcae.asm_dataset import AssemblyDataset, build_assembly_paths
-                paths = build_assembly_paths(self.cfg.asm_data_dir)
-                asm_items = []
-                if paths:
-                    ds = AssemblyDataset(paths, seed=self.cfg.seed, max_samples=self.cfg.max_prompts)
-                    asm_items = [{"prompt": i["prompt"], "target": i["target"], "kind": "asm"} for i in ds]
-                # Interleave
-                rng = random.Random(self.cfg.seed)
-                rng.shuffle(code_items)
-                items = code_items[:self.cfg.max_prompts // 2] + asm_items[:self.cfg.max_prompts // 2]
-                rng.shuffle(items)
-                return items[: self.cfg.max_prompts]
-            else:
-                raise ValueError(name)
+                return [{"prompt": i["prompt"], "target": i["target"], "kind": "asm"} for i in ds]
+            # both: load code problems + assembly, round-robin interleave
+            code_items = self._load_code_problems()
+            asm_ds = AssemblyDataset(paths, seed=self.cfg.seed, max_samples=self.cfg.max_prompts)
+            asm_items = [{"prompt": i["prompt"], "target": i["target"], "kind": "asm"} for i in asm_ds]
+            half = self.cfg.max_prompts // 2
+            code_items = code_items[:half]
+            asm_items = asm_items[:half]
+            rng = random.Random(self.cfg.seed)
+            rng.shuffle(code_items)
+            rng.shuffle(asm_items)
+            items = []
+            for k in range(max(len(code_items), len(asm_items))):
+                if k < len(code_items):
+                    items.append(code_items[k])
+                if k < len(asm_items):
+                    items.append(asm_items[k])
+            return items[: self.cfg.max_prompts]
 
+        try:
+            items = self._load_code_problems(name)
             rng = random.Random(self.cfg.seed)
             rng.shuffle(items)
             return items[: self.cfg.max_prompts]
         except Exception:
-            # _builtin_problems returns code problems
             items = _builtin_problems(self.cfg.max_prompts)
             for i in items:
                 i["kind"] = "code"
             return items
+
+    def _load_code_problems(self, name: str = "mbpp") -> list[dict]:
+        from datasets import load_dataset
+
+        if name == "mbpp":
+            ds = load_dataset("google-research-datasets/mbpp", "sanitized", split="train")
+            items = []
+            for item in ds:
+                tests = item["test_list"]
+                test_str = "\n".join(tests)
+                entry = tests[0].split("assert ")[1].split("(")[0] if tests else "solution"
+                func_sig = item["code"].split("\n")[0]
+                full_prompt = f"{item['prompt']}\n{func_sig}"
+                items.append({
+                    "prompt": full_prompt,
+                    "test": test_str,
+                    "entry": entry,
+                    "kind": "code",
+                })
+        elif name == "humaneval":
+            ds = load_dataset("openai/openai_humaneval", split="test")
+            items = []
+            for item in ds:
+                items.append({
+                    "prompt": item["prompt"],
+                    "test": "\n".join([f"assert {t}" for t in item.get("test", "").split("\n") if t.strip()]) if item.get("test") else "",
+                    "entry": item.get("entry_point", "solution"),
+                    "kind": "code",
+                })
+        elif name == "bigcodebench":
+            ds = load_dataset("bigcode/bigcodebench", split="v0.1")
+            items = [{"prompt": i["prompt"], "test": i.get("test",""), "entry": i.get("entry_point","solution"), "kind": "code"} for i in ds]
+        else:
+            raise ValueError(f"Unknown dataset: {name}")
+        return items
 
     def __len__(self) -> int:
         return len(self._items)
@@ -201,7 +193,7 @@ def _builtin_problems(n: int) -> list[dict]:
     """Fallback: 50 diverse coding problems with multi-assert tests."""
     problems = [
         # ── Math / numbers ──
-        {"prompt": "def add(a, b):\n    \"\"\"Return the sum of a and b.\"\"\"\n", "test": "assert add(2,3)==5; assert add(-1,1)==0; assert add(0,0)==0\n", "entry": "add"},
+        {"prompt": "def add(a, b):\n    \"\"\"Return the sum of a and b.\"\"\"\n", "test": "assert add(2,3)==5; assert add(-1,1)==0; assert add(0,0)==0\n", "entry": "add", "kind": "code"},
         {"prompt": "def factorial(n):\n    \"\"\"Return n! recursively.\"\"\"\n", "test": "assert factorial(0)==1; assert factorial(1)==1; assert factorial(5)==120; assert factorial(7)==5040\n", "entry": "factorial"},
         {"prompt": "def is_prime(n):\n    \"\"\"Return True if n is prime.\"\"\"\n", "test": "assert is_prime(2); assert is_prime(17); assert is_prime(97); assert not is_prime(1); assert not is_prime(4); assert not is_prime(100)\n", "entry": "is_prime"},
         {"prompt": "def gcd(a, b):\n    \"\"\"Return greatest common divisor.\"\"\"\n", "test": "assert gcd(48,18)==6; assert gcd(7,13)==1; assert gcd(100,10)==10; assert gcd(0,5)==5\n", "entry": "gcd"},
@@ -266,6 +258,9 @@ def _builtin_problems(n: int) -> list[dict]:
         {"prompt": "def is_substring(s, sub):\n    \"\"\"Return True if sub appears in s (case-sensitive). Do NOT use 'in'.\"\"\"\n", "test": "assert is_substring('hello','ell'); assert is_substring('abc','abc'); assert not is_substring('abc','abcd'); assert not is_substring('','a')\n", "entry": "is_substring"},
         {"prompt": "def title_case(s):\n    \"\"\"Convert to title case: first letter upper, rest lower, per word.\"\"\"\n", "test": "assert title_case('hello world')=='Hello World'; assert title_case('HELLO')=='Hello'; assert title_case('a b c')=='A B C'\n", "entry": "title_case"},
     ]
+    # Ensure every item has kind="code"
+    for p in problems:
+        p.setdefault("kind", "code")
     rng = random.Random(42)
     items = []
     while len(items) < n:
@@ -295,13 +290,14 @@ def extract_code(text: str) -> str:
 
 
 def extract_code_c(text: str) -> str:
-    """Extract C code from model completion. Looks for ```c fence."""
-    if "```c" in text:
-        parts = text.split("```c", 1)
-        if len(parts) > 1:
-            code = parts[1].split("```", 1)[0]
-            if code.strip():
-                return code.strip()
+    """Extract C code from model completion. Handles ```c, ```C, ```cpp."""
+    for fence in ("```cpp", "```c", "```C"):
+        if fence in text:
+            parts = text.split(fence, 1)
+            if len(parts) > 1:
+                code = parts[1].split("```", 1)[0]
+                if code.strip():
+                    return code.strip()
     # Try any code fence
     if "```" in text:
         parts = text.split("```", 1)
@@ -313,8 +309,14 @@ def extract_code_c(text: str) -> str:
 
 
 def verify_compile(code: str, timeout: float = 15.0) -> tuple[float, str]:
-    """Compile C code with GCC. Returns (1.0, feedback) on success."""
+    """Compile C code with GCC. Returns (1.0, feedback) on success.
+
+    Runs on rented GPU instances — no host compromise risk.
+    """
     import tempfile
+    import shutil
+    if not shutil.which("gcc"):
+        return 0.0, "GCC not found."
     if not code.strip():
         return 0.0, "Empty code."
     with tempfile.NamedTemporaryFile(
@@ -803,28 +805,33 @@ class SRPOTrainer:
                 batch_mask[j, PL:] = 1
             rwd = torch.tensor([c["reward"] for c in correct], device=self.device)
 
-            # Current log-probs: already cached from _generate (no extra forward)
-            lp = torch.zeros(len(correct), L_max, device=self.device)
-            for j, c in enumerate(correct):
-                L = c["full_ids"].shape[0]
-                PL = c["prompt_len"]
-                lp[j, PL:L] = c["token_lp"][:L - PL]
+            # Skip old-policy forward when all rewards identical (no GRPO signal).
+            # Common at start: all correct → all reward=1, advantage=0.
+            if rwd.std() < 1e-7:
+                grpo_l = torch.tensor(0.0, device=self.device)
+            else:
+                # Current log-probs: already cached from _generate (no extra forward)
+                lp = torch.zeros(len(correct), L_max, device=self.device)
+                for j, c in enumerate(correct):
+                    L = c["full_ids"].shape[0]
+                    PL = c["prompt_len"]
+                    lp[j, PL:L] = c["token_lp"][:L - PL]
 
-            # Old-policy log-probs: forward with old-policy modules swapped in.
-            # Uses context manager to guarantee restoration even on exception.
-            with self._old_policy_ctx():
-                with torch.no_grad():
-                    logits_old = self._model_unwrapped.forward(
-                        input_ids=batch_ids, n_loops=T, return_logits=True)
-            log_probs_old = F.log_softmax(logits_old.float(), dim=-1).to(logits_old.dtype)
-            lp_old = torch.zeros(len(correct), L_max, device=self.device)
-            for j, c in enumerate(correct):
-                L = c["full_ids"].shape[0]
-                PL = c["prompt_len"]
-                gen_pos = torch.arange(PL, L, device=self.device)
-                lp_old[j, PL:L] = log_probs_old[j, gen_pos - 1, batch_ids[j, gen_pos]]
+                # Old-policy log-probs: forward with old-policy modules swapped in.
+                # Uses context manager to guarantee restoration even on exception.
+                with self._old_policy_ctx():
+                    with torch.no_grad():
+                        logits_old = self._model_unwrapped.forward(
+                            input_ids=batch_ids, n_loops=T, return_logits=True)
+                log_probs_old = F.log_softmax(logits_old.float(), dim=-1).to(logits_old.dtype)
+                lp_old = torch.zeros(len(correct), L_max, device=self.device)
+                for j, c in enumerate(correct):
+                    L = c["full_ids"].shape[0]
+                    PL = c["prompt_len"]
+                    gen_pos = torch.arange(PL, L, device=self.device)
+                    lp_old[j, PL:L] = log_probs_old[j, gen_pos - 1, batch_ids[j, gen_pos]]
 
-            grpo_l = grpo_loss(lp, lp_old, rwd, batch_mask, cfg.clip_epsilon, cfg.clip_epsilon_high)
+                grpo_l = grpo_loss(lp, lp_old, rwd, batch_mask, cfg.clip_epsilon, cfg.clip_epsilon_high)
 
         # --- SDPO branch: failed samples (batched) ---
         failed = [c for c in comps if c["reward"] <= 0 and c.get("sdpo_feedback")]
