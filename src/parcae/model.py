@@ -668,19 +668,36 @@ class RecurrentDepthGemma(nn.Module):
     def generate(
         self,
         input_ids: torch.Tensor,
-        max_new_tokens: int = 64,
-        n_loops: int = 1,
-        temperature: float = 0.7,
+        max_new_tokens: int = 256,
+        n_loops: Optional[int] = None,
+        temperature: float = 1.0,
         top_k: int = 50,
         return_logprobs: bool = False,
+        # Standard HF generate kwargs (accepted for TRL compatibility, ignored):
+        attention_mask: Optional[torch.Tensor] = None,
+        generation_config: Optional[object] = None,
+        do_sample: bool = True,
+        top_p: Optional[float] = None,
+        **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Generate tokens with injection applied at every step.
+        """Generate tokens with recurrent-depth prefill.
 
-        self.forward() for prompt: produces logits + caches e.
-        Incremental decode via self._language_model with DynamicCache,
-        injecting (A-1)*h + B*norm(e) after each step.  Position
-        IDs computed from cache length for correct RoPE encoding.
+        Prefill uses recurrent pipeline (prelude + loop + coda).
+        Incremental decode uses backbone lm() with DynamicCache.
+        Compatible with TRL GRPOTrainer (accepts standard HF kwargs).
+
+        Args:
+            input_ids: Prompt token IDs (B, T).
+            max_new_tokens: Maximum tokens to generate.
+            n_loops: Recurrent depth (default from cfg).
+            temperature: Sampling temperature.
+            top_k: Top-k sampling.
+            return_logprobs: Return (ids, token_logprobs) tuple.
+            attention_mask, generation_config, do_sample, top_p: accepted
+                for TRL compatibility; ignored by this implementation.
         """
+        if n_loops is None:
+            n_loops = getattr(self, 'n_loops', self.cfg.default_loops)
         device = input_ids.device
         token_lps = [] if return_logprobs else None
 
