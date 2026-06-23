@@ -8,7 +8,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 MODEL_PATH = os.environ.get(
     "MODEL_PATH",
-    "google/gemma-4-E2B-it",
+    "google/gemma-4-E4B-it",
 )
 
 PROMPTS = [
@@ -40,8 +40,8 @@ class TestIdentity:
     @classmethod
     def our_model(cls):
         cfg = RecurrentDepthConfig(
-            model_path=MODEL_PATH, prelude_layers=12,
-            n_recurrent_layers=11, coda_layers=12)
+            model_path=MODEL_PATH, prelude_layers=14,
+            n_recurrent_layers=14, coda_layers=14)
         model = RecurrentDepthGemma(cfg)
         model.load_pretrained()
         model.eval()

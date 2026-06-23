@@ -2,7 +2,7 @@
 # parcae-srpo: one-command setup → test → train
 set -euo pipefail
 
-MODEL="google/gemma-4-E2B-it"
+MODEL="google/gemma-4-E4B-it"
 PYTHON=${PYTHON:-python3}
 NPROC=${NPROC:-2}
 

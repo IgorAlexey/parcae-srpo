@@ -80,9 +80,9 @@ class RecurrentDepthConfig:
     """Configuration for the recurrent-depth retrofit."""
 
     # Path to the pretrained Gemma 4 model
-    model_path: str = "google/gemma-4-E2B-it"
+    model_path: str = "google/gemma-4-E4B-it"
 
-    # Layer split must sum to model's total (e.g., 12+11+12=35 for E2B)
+    # Layer split must sum to model's total (e.g., 14+14+14=42 for E4B)
     prelude_layers: int = 12
     n_recurrent_layers: int = 11  # these get looped
     coda_layers: int = 12
@@ -93,7 +93,7 @@ class RecurrentDepthConfig:
     # Whether to add depth-wise LoRA adapters in the recurrent block
     # (per-loop parameter variation, as in OpenMythos / LoopFormer)
     use_depth_lora: bool = True
-    lora_rank: int = 16
+    lora_rank: int = 128                  # rank=128 gives ~669K trainable DepthLoRA params for E4B
 
     # Whether to add a sinusoidal loop-index embedding to the hidden state
     # at each iteration (distinguishes early from late loop passes)
@@ -178,7 +178,7 @@ class RecurrentDepthGemma(nn.Module):
     Adds LTIInjection, optional depth-wise LoRA, and loop-index embeddings.
 
     Usage:
-        cfg = RecurrentDepthConfig(model_path="google/gemma-4-E2B-it",
+        cfg = RecurrentDepthConfig(model_path="google/gemma-4-E4B-it",
                                     prelude_layers=12,
                                     n_recurrent_layers=11,
                                     coda_layers=12)

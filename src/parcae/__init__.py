@@ -2,7 +2,7 @@
 Recurrent-Depth Gemma 4; retrofit a pretrained N-layer model
 into a middle-looped recurrent-depth transformer (Parcae, 2026).
 
-Tested configuration: Gemma 4 E2B (35 layers → 12+11+12 split).
+Tested configuration: Gemma 4 E4B (42 layers -> 14+14+14 split).
 
 Architecture:
     Prelude (first 12 layers) → run once

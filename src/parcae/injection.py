@@ -38,7 +38,7 @@ class LTIInjection(nn.Module):
     Discretization happens in get_A() / get_B() each forward pass.
 
     Args:
-        dim: Hidden state dimension (1536 for Gemma E2B, 3840 for 12B)
+        dim: Hidden state dimension (2560 for Gemma E4B, 3840 for 12B)
     """
 
     def __init__(self, dim: int):

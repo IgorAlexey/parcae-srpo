@@ -1,5 +1,5 @@
 """
-SRPO training for recurrent-depth Gemma E2B.
+SRPO training for recurrent-depth Gemma E4B.
 
 Self-Reflective Policy Optimization (ICML 2026, arxiv 2604.02288):
   Correct samples → GRPO branch (sequence-level group-relative advantage)
@@ -45,12 +45,12 @@ from parcae import RecurrentDepthGemma, RecurrentDepthConfig
 @dataclass
 class TrainConfig:
     # ── Model ──
-    model_name: str = "google/gemma-4-E2B-it"
+    model_name: str = "google/gemma-4-E4B-it"
     model_path: Optional[str] = None       # set to local cache path to skip download
-    prelude_layers: int = 12               # E2B: 35 layers → 12 + 11 + 12 split
-    n_recurrent_layers: int = 11
-    coda_layers: int = 12
-    lora_rank: int = 16
+    prelude_layers: int = 14               # E4B: 42 layers -> 14 + 14 + 14 split
+    n_recurrent_layers: int = 14
+    coda_layers: int = 14
+    lora_rank: int = 128
     loop_embedding_dim: int = 128
 
     # ── Recurrent depth (Parcae) ──
@@ -61,11 +61,11 @@ class TrainConfig:
 
     # ── SRPO algorithm ──
     group_size: int = 6                    # G completions per prompt (≥4 for meaningful GRPO advantage; Unsloth/TRL use 6-8)
-    max_response_tokens: int = 128          # enough for code/assembly (DeepSeekMath: 4K; we trade length for memory)
+    max_response_tokens: int = 256          # enough for C function + assembly explanation
     gen_temperature: float = 1.0            # 1.0 standard for RL exploration (TRL/DeepSeekMath/veRL all default 1.0)
     clip_epsilon: float = 0.2
     clip_epsilon_high: float = 0.28        # GSPO Clip-Higher
-    kl_beta: float = 0.0
+    kl_beta: float = 0.04                  # KL penalty (TRL/DeepSeekMath: 0.04; lower to 0.001 for LoRA)
     entropy_weight: float = 0.01           # SRPO entropy-aware weighting
 
     # ── Optimization ──
@@ -376,39 +376,55 @@ def grpo_loss(
     response_mask: torch.Tensor,     # (B, L)
     epsilon: float,
     epsilon_high: float,
+    G: int = None,                   # group_size for per-prompt normalization
+    beta: float = 0.0,               # KL penalty coefficient (TRL default: 0.04)
 ) -> torch.Tensor:
     """
-    GRPO branch: sequence-level group-relative advantage.  One scalar
-    importance ratio per sequence (GSPO sequence-level formulation),
-    clipped PPO-style with asymmetric Clip-Higher.
+    GRPO branch: per-prompt group-relative advantage (DeepSeekMath/TRL).
 
-    B is the group size (all completions for one or more prompts).
+    Each prompt's G completions compete only against each other.
+    Advantage normalized within each prompt group, then concatenated.
+    Sequence-level importance ratios (GSPO formulation) with
+    asymmetric Clip-Higher.
     """
     B = rewards.shape[0]
-    if B < 2:
+    if B < 2 or G is None:
         return torch.tensor(0.0, device=rewards.device)
+
+    # Per-prompt group normalization (matches TRL/DeepSeekMath)
+    n_prompts = B // G
+    if n_prompts * G != B:
+        # Incomplete group: skip or pad
+        return torch.tensor(0.0, device=rewards.device)
+    r_grouped = rewards.view(n_prompts, G)  # (P, G)
+    mu = r_grouped.mean(dim=1, keepdim=True)  # per-prompt mean
+    sigma = r_grouped.std(dim=1, keepdim=True) + 1e-8
+    A = ((r_grouped - mu) / sigma).view(B)  # per-prompt advantage, flattened
 
     # sequence-level log‑prob (mean over response tokens)
     n_tokens = response_mask.sum(dim=-1).clamp(min=1)       # (B,)
     seq_lp = (log_probs * response_mask).sum(dim=-1) / n_tokens
     seq_lp_old = (log_probs_old * response_mask).sum(dim=-1) / n_tokens
 
-    # group-relative advantage
-    mu = rewards.mean()
-    sigma = rewards.std() + 1e-8
-    A = (rewards - mu) / sigma                                    # (B,)
-
-    # sequence-level importance ratio (length-normalized)
+    # sequence-level importance ratio (length-normalized, GSPO)
     rho = torch.exp(seq_lp - seq_lp_old)                          # (B,)
 
     # clipped surrogate (sequence level)
     rho_clip = torch.clamp(rho, 1.0 - epsilon, 1.0 + epsilon_high)
     surr = torch.min(rho * A, rho_clip * A)                       # (B,)
 
-    # expand to token level: every token in sequence i gets the same
-    # scalar surrogate weight
-    per_token = surr.unsqueeze(-1) * response_mask                # (B, L)
-    loss = -per_token.sum() / n_tokens.sum().clamp(min=1)
+    # Per-sequence loss, averaged across sequences (DeepSeekMath convention)
+    per_seq_loss = -(surr)  # (B,) negative surrogate per sequence
+    loss = per_seq_loss.mean()
+
+    # KL penalty: unbiased reverse-KL estimator (TRL k3 estimator)
+    if beta > 0:
+        token_lp = (log_probs * response_mask).sum() / response_mask.sum().clamp(min=1)
+        token_lp_old = (log_probs_old * response_mask).sum() / response_mask.sum().clamp(min=1)
+        delta = token_lp_old - token_lp
+        kl_est = torch.exp(delta) - delta - 1.0
+        loss = loss + beta * kl_est
+
     return loss
 
 
@@ -492,6 +508,11 @@ class SRPOTrainer:
         self._load_chat_template(cfg)
         self._build_model()
         self._build_optimizer()
+
+        # Format bootstrap: teach the model to output ```c blocks
+        # before GRPO takes over. 10 steps, 8 samples, LR=5e-4.
+        self._format_bootstrap()
+
         self.dataset = CodeProblemDataset(cfg)
 
         if self.world_size > 1:
@@ -523,7 +544,7 @@ class SRPOTrainer:
     def _load_chat_template(self, cfg):
         """Ensure the tokenizer has a chat template.
 
-        Gemma 4 E2B ships chat_template.jinja separately (HF issue 45205).
+        Gemma 4 E4B ships chat_template.jinja separately (HF issue 45205).
         Other model families embed it in tokenizer_config.json; skip if
         already present.
 
@@ -675,6 +696,79 @@ class SRPOTrainer:
             weight_decay=self.cfg.weight_decay,
         )
 
+    # ── format bootstrap ───────────────────────────────────────────
+
+    def _format_bootstrap(self):
+        """Teach the model to output ```c blocks before GRPO.
+
+        Takes 8 samples from the assembly dataset's target C code,
+        runs 10 SFT steps at LR=5e-4.  Only rank 0 runs this;
+        other ranks sync via barrier.
+        """
+        if self.local_rank != 0:
+            if self.world_size > 1:
+                dist.barrier()
+            return
+
+        print("  [bootstrap] teaching ```c format...", flush=True)
+
+        # Grab 8 C code samples from assembly dataset
+        from parcae.asm_dataset import AssemblyDataset, build_assembly_paths
+        paths = build_assembly_paths("data")
+        if not paths:
+            print("  [bootstrap] no assembly data, skipping", flush=True)
+            if self.world_size > 1:
+                dist.barrier()
+            return
+        asm_ds = AssemblyDataset(paths, seed=42, max_samples=8)
+
+        samples = []
+        for item in asm_ds:
+            # Extract C code from target (format: "C:\n```c\n...\n```\n\nAssembly:...")
+            target = item["target"]
+            if "```c" in target:
+                code = target.split("```c", 1)[1].split("```", 1)[0].strip()
+            else:
+                code = target.strip()
+            # Build prompt: ask for C code, answer with ```c formatted code
+            prompt = f"Write C code for the following:\n{item['prompt']}"
+            answer = f"```c\n{code}\n```"
+            samples.append((prompt, answer))
+
+        # Quick SFT on these 8 samples
+        opt = torch.optim.AdamW(self._model_unwrapped.trainable_parameters(), lr=5e-4)
+        for step in range(10):
+            total_loss = 0.0
+            for prompt, answer in samples:
+                full_text = self._apply_chat_template(prompt) + answer
+                enc = self._tokenize_safe([full_text])
+                ids = enc["input_ids"].to(self.device)
+                attn = enc["attention_mask"].to(self.device)
+                opt.zero_grad()
+                logits = self._model_unwrapped.forward(
+                    ids, n_loops=1, return_logits=True)
+                # Cross-entropy on all tokens (shifted)
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = ids[:, 1:].contiguous()
+                loss = torch.nn.functional.cross_entropy(
+                    shift_logits.view(-1, shift_logits.shape[-1]),
+                    shift_labels.view(-1),
+                    reduction="mean",
+                )
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self._model_unwrapped.trainable_parameters(), 1.0)
+                opt.step()
+                total_loss += loss.item()
+            if step % 5 == 0 or step == 9:
+                print(f"  [bootstrap] step {step+1}/10 loss={total_loss/len(samples):.4f}",
+                      flush=True)
+
+        del opt
+        print("  [bootstrap] done", flush=True)
+        if self.world_size > 1:
+            dist.barrier()
+
     # ── generation with log‑prob caching ───────────────────────────
 
     @torch.no_grad()
@@ -790,48 +884,54 @@ class SRPOTrainer:
                 k = batch[c["batch_idx"]].get("kind", "code")
                 c["sdpo_feedback"] = build_feedback(c["text"], c["feedback"], prompts[c["batch_idx"]], demos, kind=k)
 
-        # --- GRPO branch: correct samples (batched) ---
+        # --- GRPO branch: correct samples (per-prompt groups) ---
         correct = [c for c in comps if c["reward"] > 0]
         grpo_l = torch.tensor(0.0, device=self.device)
-        if len(correct) >= 2:
-            # Pad all correct completions to uniform length
-            L_max = max(c["full_ids"].shape[0] for c in correct)
-            batch_ids = torch.zeros(len(correct), L_max, dtype=torch.long, device=self.device)
-            batch_mask = torch.zeros(len(correct), L_max, device=self.device)
-            for j, c in enumerate(correct):
+
+        # Group by prompt for per-prompt advantage normalization
+        correct_by_batch = {b: [] for b in range(B)}
+        for c in correct:
+            correct_by_batch[c["batch_idx"]].append(c)
+
+        for batch_idx, group_correct in correct_by_batch.items():
+            if len(group_correct) < 2:
+                continue
+            L_max = max(c["full_ids"].shape[0] for c in group_correct)
+            n = len(group_correct)
+            batch_ids = torch.zeros(n, L_max, dtype=torch.long, device=self.device)
+            batch_mask = torch.zeros(n, L_max, device=self.device)
+            for j, c in enumerate(group_correct):
                 L = c["full_ids"].shape[0]
                 PL = c["prompt_len"]
                 batch_ids[j, :L] = c["full_ids"].to(self.device)
                 batch_mask[j, PL:] = 1
-            rwd = torch.tensor([c["reward"] for c in correct], device=self.device)
+            rwd = torch.tensor([c["reward"] for c in group_correct], device=self.device)
 
-            # Skip old-policy forward when all rewards identical (no GRPO signal).
-            # Common at start: all correct → all reward=1, advantage=0.
             if rwd.std() < 1e-7:
-                grpo_l = torch.tensor(0.0, device=self.device)
-            else:
-                # Current log-probs: already cached from _generate (no extra forward)
-                lp = torch.zeros(len(correct), L_max, device=self.device)
-                for j, c in enumerate(correct):
-                    L = c["full_ids"].shape[0]
-                    PL = c["prompt_len"]
-                    lp[j, PL:L] = c["token_lp"][:L - PL]
+                continue
 
-                # Old-policy log-probs: forward with old-policy modules swapped in.
-                # Uses context manager to guarantee restoration even on exception.
-                with self._old_policy_ctx():
-                    with torch.no_grad():
-                        logits_old = self._model_unwrapped.forward(
-                            input_ids=batch_ids, n_loops=T, return_logits=True)
-                log_probs_old = F.log_softmax(logits_old.float(), dim=-1).to(logits_old.dtype)
-                lp_old = torch.zeros(len(correct), L_max, device=self.device)
-                for j, c in enumerate(correct):
-                    L = c["full_ids"].shape[0]
-                    PL = c["prompt_len"]
-                    gen_pos = torch.arange(PL, L, device=self.device)
-                    lp_old[j, PL:L] = log_probs_old[j, gen_pos - 1, batch_ids[j, gen_pos]]
+            lp = torch.zeros(n, L_max, device=self.device)
+            for j, c in enumerate(group_correct):
+                L = c["full_ids"].shape[0]
+                PL = c["prompt_len"]
+                lp[j, PL:L] = c["token_lp"][:L - PL]
 
-                grpo_l = grpo_loss(lp, lp_old, rwd, batch_mask, cfg.clip_epsilon, cfg.clip_epsilon_high)
+            with self._old_policy_ctx():
+                with torch.no_grad():
+                    logits_old = self._model_unwrapped.forward(
+                        input_ids=batch_ids, n_loops=T, return_logits=True)
+            log_probs_old = F.log_softmax(logits_old.float(), dim=-1).to(logits_old.dtype)
+            lp_old = torch.zeros(n, L_max, device=self.device)
+            for j, c in enumerate(group_correct):
+                L = c["full_ids"].shape[0]
+                PL = c["prompt_len"]
+                gen_pos = torch.arange(PL, L, device=self.device)
+                lp_old[j, PL:L] = log_probs_old[j, gen_pos - 1, batch_ids[j, gen_pos]]
+
+            grpo_l = grpo_l + grpo_loss(
+                lp, lp_old, rwd, batch_mask,
+                cfg.clip_epsilon, cfg.clip_epsilon_high,
+                G=cfg.group_size, beta=cfg.kl_beta)
 
         # --- SDPO branch: failed samples (batched) ---
         failed = [c for c in comps if c["reward"] <= 0 and c.get("sdpo_feedback")]
@@ -938,7 +1038,7 @@ class SRPOTrainer:
         cfg = self.cfg
         if self.local_rank == 0:
             print(f"{'='*60}")
-            print(f"SRPO · Recurrent-Depth Gemma E2B · {cfg.total_steps} steps")
+            print(f"SRPO · Recurrent-Depth Gemma E4B · {cfg.total_steps} steps")
             print(f"G={cfg.group_size} · T~Poisson({cfg.poisson_mean}) · μ_bwd≈{cfg.bptt_ratio}T")
             print(f"Device: {self.device} · World: {self.world_size}")
             print(f"{'='*60}")

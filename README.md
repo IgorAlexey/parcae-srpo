@@ -1,11 +1,11 @@
 # parcae-srpo
 
-Recurrent-depth transformer retrofitted onto Gemma 4 E2B, trained via
+Recurrent-depth transformer retrofitted onto Gemma 4 E4B, trained via
 self-reflective policy optimization with verifiable code execution rewards.
 
 ## Overview
 
-We take a pretrained 35-layer Gemma 4 E2B and split it into three blocks:
+We take a pretrained 42-layer Gemma 4 E4B and split it into three blocks:
 a 12-layer prelude, an 11-layer recurrent core, and a 12-layer coda. The
 recurrent core is executed T times per forward pass with a stable injection
 mechanism that prevents hidden-state drift across iterations. At T=1 the
@@ -79,7 +79,7 @@ pip install parcae-srpo
 from parcae import RecurrentDepthGemma, RecurrentDepthConfig
 
 config = RecurrentDepthConfig(
-    model_path = "google/gemma-4-E2B-it",
+    model_path = "google/gemma-4-E4B-it",
     prelude_layers = 12,
     n_recurrent_layers = 11,
     coda_layers = 12,
