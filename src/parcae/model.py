@@ -715,12 +715,10 @@ class RecurrentDepthGemma(nn.Module):
                 input_ids=next_tok, use_cache=True, past_key_values=past,
                 position_ids=pos)
             past = out.past_key_values
-            h = out.last_hidden_state
+            h = out.last_hidden_state  # already normed by lm's internal norm
 
-            if e is not None:
-                h = inj(h, e, h)  # inj.forward applies prelude_norm to e
-
-            h = self.norm(h)
+            # Injection is prefill-only (already applied via self.forward).
+            # During decode, use standard lm_head on lm's normed output.
             step_logits = self.lm_head(h)
             if self._logit_softcap is not None:
                 step_logits = (self._logit_softcap *
